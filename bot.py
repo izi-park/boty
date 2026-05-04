@@ -179,7 +179,6 @@ def main():
             # обычный ответ
             answer = get_answer(event.text, user_id)
             send(user_id, answer)
-
 if __name__ == "__main__":
     main()
    
