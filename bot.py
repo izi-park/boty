@@ -129,7 +129,7 @@ def get_answer(text, user_id):
     if "оператор" in text:
         operator_mode[user_id] = True
         return (
-            "👨‍💻 Вы подключены к оператору.\n"\n"
+            "👨‍💻 Вы подключены к оператору.\n\n"
             "Чтобы вернуть бота - напишите: СТОП ОПЕРАТОР"
         )
 
@@ -139,8 +139,11 @@ def get_answer(text, user_id):
 # 🚀 ЗАПУСК
 # =====================
 def main():
+   def main():
     if not TOKEN:
         raise RuntimeError("VK token is not set.")
+
+    print("Бот запущен...")
 
     for event in longpoll.listen():
 
@@ -149,32 +152,34 @@ def main():
 
         user_id = event.user_id
 
-        # 📩 пользователь пишет
-        if event.to_me and not event.from_me:
+        # =====================
+        # 👨‍💻 ПИШЕТ ОПЕРАТОР
+        # =====================
+        if event.from_me:
+            operator_mode[user_id] = True
+            continue
 
-            # если оператор уже отвечает — бот молчит
+        # =====================
+        # 📩 ПИШЕТ ПОЛЬЗОВАТЕЛЬ
+        # =====================
+        if event.to_me:
+
+            text = event.text.lower()
+
+            # ✅ ВСЕГДА можно выйти из оператора
+            if text == "стоп оператор":
+                operator_mode[user_id] = False
+                send(user_id, "✅ Бот снова активен")
+                continue
+
+            # если оператор включён — бот молчит
             if operator_mode.get(user_id):
                 continue
 
+            # обычный ответ
             answer = get_answer(event.text, user_id)
             send(user_id, answer)
 
-        # 👨‍💻 пишет оператор
-        if event.from_me:
-            operator_mode[user_id] = True
-
 if __name__ == "__main__":
-    if event.to_me and not event.from_me:
-
-    # ✅ ВСЕГДА даём возможность выйти из оператора
-    if event.text.lower() == "стоп оператор":
-        operator_mode[user_id] = False
-        send(user_id, "✅ Бот снова активен")
-        continue
-
-    # если оператор активен — бот молчит
-    if operator_mode.get(user_id):
-        continue
-
-    answer = get_answer(event.text, user_id)
-    send(user_id, answer)
+    main()
+   
