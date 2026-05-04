@@ -129,7 +129,8 @@ def get_answer(text, user_id):
     if "оператор" in text:
         operator_mode[user_id] = True
         return (
-            "👨‍💻 Оператор подключится в ближайшее время.\n"
+            "👨‍💻 Вы подключены к оператору.\n"\n"
+            "Чтобы вернуть бота - напишите: СТОП ОПЕРАТОР"
         )
 
     return "👇 Выберите раздел или напишите вопрос подробнее"
@@ -163,4 +164,17 @@ def main():
             operator_mode[user_id] = True
 
 if __name__ == "__main__":
-    main()
+    if event.to_me and not event.from_me:
+
+    # ✅ ВСЕГДА даём возможность выйти из оператора
+    if event.text.lower() == "стоп оператор":
+        operator_mode[user_id] = False
+        send(user_id, "✅ Бот снова активен")
+        continue
+
+    # если оператор активен — бот молчит
+    if operator_mode.get(user_id):
+        continue
+
+    answer = get_answer(event.text, user_id)
+    send(user_id, answer)
