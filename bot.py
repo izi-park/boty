@@ -139,7 +139,6 @@ def get_answer(text, user_id):
 # 🚀 ЗАПУСК
 # =====================
 def main():
-   def main():
     if not TOKEN:
         raise RuntimeError("VK token is not set.")
 
