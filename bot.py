@@ -19,6 +19,7 @@ longpoll = VkLongPoll(vk_session)
 # 🧠 ПАМЯТЬ
 # =====================
 # пользователи, с которыми сейчас работает оператор
+last_event_id = None
 operator_mode = {}
 
 # =====================
@@ -146,6 +147,13 @@ def main():
 
     for event in longpoll.listen():
 
+        global last_event_id
+
+        if event.event_id == last_event_id:
+            continue
+
+        last_event_id = event.event_id
+
         if event.type != VkEventType.MESSAGE_NEW:
             continue
 
@@ -180,4 +188,3 @@ def main():
             send(user_id, answer)
 if __name__ == "__main__":
     main()
-   
