@@ -20,41 +20,51 @@ longpoll = VkLongPoll(vk_session)
 # =====================
 # 🧠 ПАМЯТЬ
 # =====================
-last_event = set()
 operator_mode = {}
+last_event = set()
 
 # =====================
 # 📌 КНОПКИ
 # =====================
 def main_keyboard():
     keyboard = VkKeyboard()
+
     keyboard.add_button("📲 Подключение", VkKeyboardColor.PRIMARY)
     keyboard.add_button("💰 Оплата и вывод", VkKeyboardColor.POSITIVE)
     keyboard.add_line()
+
     keyboard.add_button("🚴 Работа с заказами", VkKeyboardColor.PRIMARY)
     keyboard.add_button("⚠️ Проблемы", VkKeyboardColor.NEGATIVE)
     keyboard.add_line()
+
     keyboard.add_button("🧾 Как подтвердить самозанятость/ИП")
     keyboard.add_button("🧊 Термокороб")
     keyboard.add_line()
+
     keyboard.add_button("👨‍💻 Оператор")
+
     return keyboard.get_keyboard()
+
+
+# кеш клавиатуры (чуть быстрее)
+MAIN_KB = main_keyboard()
 
 # =====================
 # 📤 ОТПРАВКА
 # =====================
-def send(user_id, message):
+def send(user_id, message, keyboard=True):
     vk.messages.send(
         user_id=user_id,
         message=message,
-        random_id=random.randint(1, 2**31),
-        keyboard=main_keyboard(),
+        random_id=random.randint(1, 2**63),
+        keyboard=MAIN_KB if keyboard else None
     )
 
+
 # =====================
-# 🧠 ОТВЕТЫ
+# 🧠 ОТВЕТЫ БОТА
 # =====================
-def get_answer(text, user_id):
+def get_answer(text):
     text = text.lower()
 
     if "подключение" in text:
@@ -83,10 +93,20 @@ def get_answer(text, user_id):
     if "работа" in text:
         return (
             "🚴 Работа с заказами:\n"
-            "1. Включить «на линии»\n"
-            "2. Принять заказ\n"
-            "3. Забрать и доставить\n\n"
-            "📌 Важно соблюдать правила, чтобы избежать штрафов"
+            "1. Включить «на линии».\n"
+            "2. Принять заказ.\n"
+            "3. Забрать и доставить.\n\n"
+            "📌 Важно соблюдать правила, чтобы избежать штрафов.\n\n"
+            "📌 ВАЖНО ЗНАТЬ❗️:\n"
+        "Список советов, которые помогут избежать штрафов или оспорить уже выставленную корректировку:\n"
+        "1️⃣  При получении заказа, ВНИМАТЕЛЬНО сверьте номер в приложении и на самой посылке.\n"
+        "2️⃣  Обратите внимание, СКОЛЬКО ТОЧЕК у вас в заказе. В мультизаказе получение нескольких посылок в одном месте.\n"
+        "3️⃣  НИ В КОЕМ СЛУЧАЕ, не нажимайте статус ПОСЫЛКА ПОЛУЧЕНА если Вы не забрали посылку(будет штраф).\n"
+        "4️⃣  Дозвониться в поддержку можно только с номера, указанного в профиле Яндекс Про при регистрациии.\n"
+        "5️⃣  Если торговая точка закрыта или заказа нет в магазине-отменяйте заказ! (-7 баллов можно восполнить).\n"
+        "6️⃣  Если вы завершили заказ по причине поломки автомобиля или ДТП, ОБЯЗАТЕЛЬНО сохраните чеки оплаты, извещение о ДТП.\n"
+        "7️⃣  Если заказ с опцией ОТ ДВЕРИ ДО ДВЕРИ, не отдавайте его на улице, нужно вручить заказ в квартиру.\n\n"
+        "Эти простые правила, помогут вам обойти стороной штрафы, и неприятности на заказах."
         )
 
     if "проблем" in text:
@@ -109,16 +129,8 @@ def get_answer(text, user_id):
     if "термокороб" in text or "короб" in text:
         return "🧊 Термокороб:\nИнвентарь → Получить инвентарь"
 
-    if text == "👨‍💻 оператор" or text == "оператор":
-        operator_mode[user_id] = True
-        return (
-            "👨‍💻 Вы подключены к оператору.\n\n"
-            "✍️ Напишите свой вопрос — вам ответит человек.\n\n"
-            "❗ Чтобы вернуться к боту и кнопкам, напишите:\n"
-            "👉 СТОП ОПЕРАТОР"
-        )
-
     return "👇 Выберите раздел или напишите вопрос подробнее"
+
 
 # =====================
 # 🚀 ЗАПУСК
@@ -131,7 +143,9 @@ def main():
         if event.type != VkEventType.MESSAGE_NEW:
             continue
 
-        # защита от дублей
+        if not event.to_me:
+            continue
+
         event_id = getattr(event, "message_id", None)
         if event_id:
             if event_id in last_event:
@@ -139,33 +153,43 @@ def main():
             last_event.add(event_id)
 
         user_id = event.user_id
-        text = event.text.strip().lower()
+        text = (event.text or "").strip().lower()
 
-        # если пишешь ты (оператор)
-        if event.from_me:
-            operator_mode[user_id] = True
-            continue
-
-        # выход из оператора
-        if text == "стоп оператор":
-            operator_mode[user_id] = False
-            send(user_id, "✅ Бот снова активен\n\n👇 Можете снова пользоваться кнопками")
-            continue
-
-        # если включён оператор — подсказываем
+        # =====================
+        # ❗ РЕЖИМ ОПЕРАТОРА
+        # =====================
         if operator_mode.get(user_id):
+
+            # выход из режима оператора
+            if text == "стоп оператор":
+                operator_mode[user_id] = False
+                send(user_id, "✅ Бот снова активен\n\n👇 Можете снова пользоваться кнопками")
+                continue
+
+            # здесь сообщение идёт оператору (пока просто лог)
+            print(f"[ОПЕРАТОР] {user_id}: {text}")
+            continue
+
+        # =====================
+        # включение оператора
+        # =====================
+        if text == "👨‍💻 оператор" or text == "оператор":
+            operator_mode[user_id] = True
             send(
                 user_id,
-                "👨‍💻 Вы сейчас в режиме оператора.\n\n"
-                "✍️ Напишите вопрос — вам ответит человек.\n\n"
-                "❗ Чтобы вернуться к боту, напишите:\n"
+                "👨‍💻 Вы подключены к оператору.\n\n"
+                "✍️ Напишите свой вопрос — вам ответит человек.\n\n"
+                "❗ Чтобы вернуться к боту и кнопкам, напишите:\n"
                 "👉 СТОП ОПЕРАТОР"
             )
             continue
 
-        # ответ бота
-        answer = get_answer(text, user_id)
+        # =====================
+        # обычный бот
+        # =====================
+        answer = get_answer(text)
         send(user_id, answer)
+
 
 if __name__ == "__main__":
     main()
