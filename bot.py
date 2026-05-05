@@ -19,7 +19,7 @@ longpoll = VkLongPoll(vk_session)
 # 🧠 ПАМЯТЬ
 # =====================
 # пользователи, с которыми сейчас работает оператор
-last_event_id = None
+last_message = {}
 operator_mode = {}
 
 # =====================
@@ -149,15 +149,17 @@ def main():
 
         global last_event_id
 
-        if event.event_id == last_event_id:
-            continue
-
-        last_event_id = event.event_id
-
         if event.type != VkEventType.MESSAGE_NEW:
             continue
 
         user_id = event.user_id
+        text = event.text.strip()
+
+        # защита от дублей
+        if last_message.get(user_id) == text:
+           continue
+
+        last_message[user_id] = text
 
         # =====================
         # 👨‍💻 ПИШЕТ ОПЕРАТОР
