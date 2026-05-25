@@ -62,6 +62,19 @@ def main_keyboard():
 MAIN_KB = main_keyboard()
 
 # =====================
+# 📌 ТЕКСТЫ КНОПОК
+# =====================
+MENU_BUTTONS = [
+    "📲 подключение",
+    "💰 оплата и вывод",
+    "🚴 работа с заказами",
+    "⚠️ проблемы",
+    "🧾 как подтвердить самозанятость/ип",
+    "🧊 термокороб",
+    "🚲 аренда и ремонт"
+]
+
+# =====================
 # 📤 ОТПРАВКА
 # =====================
 def send(user_id, message, keyboard=True):
@@ -339,7 +352,7 @@ def main():
         # =====================
         if operator_mode.get(user_id):
 
-            # выход из оператора
+            # выход вручную
             if text == "стоп оператор":
 
                 operator_mode[user_id] = False
@@ -352,20 +365,17 @@ def main():
 
                 continue
 
-            # если человек снова пользуется меню
-            detected = detect_topic(text)
-
-            if detected and detected != "оператор":
+            # если человек нажал кнопку меню
+            if text in MENU_BUTTONS:
 
                 operator_mode[user_id] = False
                 operator_queue.pop(user_id, None)
 
-                answer = get_answer(detected)
+                answer = get_answer(text)
 
                 send(
                     user_id,
-                    "ℹ️ Вы снова вернулись в меню бота.\n\n"
-                    "Если позже понадобится оператор — нажмите кнопку снова.\n\n"
+                    "ℹ️ Вы вышли из режима оператора и вернулись в меню бота.\n\n"
                     + answer
                 )
 
@@ -375,13 +385,6 @@ def main():
             operator_queue[user_id] = True
 
             notify_admins(user_id, text)
-
-            send(
-                user_id,
-                "⏳ Ваше сообщение отправлено оператору.\n\n"
-                "❗ Чтобы снова пользоваться кнопками бота:\n"
-                "👉 Напишите СТОП ОПЕРАТОР"
-            )
 
             continue
 
