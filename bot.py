@@ -381,7 +381,7 @@ def main():
 
                 continue
 
-            # сообщение оператору
+            # ВСЕ ОСТАЛЬНЫЕ СООБЩЕНИЯ -> ТОЛЬКО ОПЕРАТОРУ
             operator_queue[user_id] = True
 
             notify_admins(user_id, text)
