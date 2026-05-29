@@ -29,7 +29,6 @@ ADMINS = [
 # 🧠 ПАМЯТЬ
 # =====================
 operator_mode = {}
-operator_queue = {}
 last_event = set()
 
 # =====================
@@ -104,7 +103,7 @@ def notify_admins(user_id, text):
             print(f"[ADMIN ERROR] {e}")
 
 # =====================
-# 🧠 НОРМАЛИЗАЦИЯ ТЕКСТА
+# 🧠 НОРМАЛИЗАЦИЯ
 # =====================
 def normalize_text(text):
     return text.lower().strip()
@@ -356,7 +355,6 @@ def main():
             if text == "стоп оператор":
 
                 operator_mode[user_id] = False
-                operator_queue.pop(user_id, None)
 
                 send(
                     user_id,
@@ -365,11 +363,10 @@ def main():
 
                 continue
 
-            # если человек нажал кнопку меню
+            # нажал кнопку меню
             if text in MENU_BUTTONS:
 
                 operator_mode[user_id] = False
-                operator_queue.pop(user_id, None)
 
                 answer = get_answer(text)
 
@@ -381,9 +378,7 @@ def main():
 
                 continue
 
-            # ВСЕ ОСТАЛЬНЫЕ СООБЩЕНИЯ -> ТОЛЬКО ОПЕРАТОРУ
-            operator_queue[user_id] = True
-
+            # ВСЕ ОСТАЛЬНОЕ -> ТОЛЬКО ОПЕРАТОРУ
             notify_admins(user_id, text)
 
             continue
