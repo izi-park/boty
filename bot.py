@@ -1,13 +1,12 @@
 import os
 import random
+import time
+import threading
 import vk_api
 
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 from vk_api.longpoll import VkEventType, VkLongPoll
 
-# =====================
-# 🔑 ТОКЕН
-# =====================
 TOKEN = os.getenv("VK_TOKEN")
 
 if not TOKEN:
@@ -17,65 +16,51 @@ vk_session = vk_api.VkApi(token=TOKEN)
 vk = vk_session.get_api()
 longpoll = VkLongPoll(vk_session)
 
-# =====================
-# 👨‍💻 АДМИНЫ
-# =====================
-ADMINS = [
-    8302706,
-    526574493
-]
+ADMINS = [8302706, 526574493]
 
-# =====================
-# 🧠 ПАМЯТЬ
-# =====================
 operator_mode = {}
+operator_started_at = {}
+operator_has_question = {}
+operator_warned = {}
 last_event = set()
 
-# =====================
-# 📌 КНОПКИ
-# =====================
+OPERATOR_WARNING_TIME = 120
+OPERATOR_CLOSE_TIME = 1200
+
 def main_keyboard():
     keyboard = VkKeyboard()
 
     keyboard.add_button("📲 Подключение", VkKeyboardColor.PRIMARY)
+    keyboard.add_button("🧾 Самозанятость / ИП")
+    keyboard.add_line()
+
     keyboard.add_button("💰 Оплата и вывод", VkKeyboardColor.POSITIVE)
-    keyboard.add_line()
-
     keyboard.add_button("🚴 Работа с заказами", VkKeyboardColor.PRIMARY)
-    keyboard.add_button("⚠️ Проблемы", VkKeyboardColor.NEGATIVE)
     keyboard.add_line()
 
-    keyboard.add_button("🧾 Как подтвердить самозанятость/ИП")
+    keyboard.add_button("⚠️ Проблемы", VkKeyboardColor.NEGATIVE)
     keyboard.add_button("🧊 Термокороб")
     keyboard.add_line()
 
     keyboard.add_button("🚲 Аренда и ремонт")
-
     keyboard.add_line()
 
     keyboard.add_button("👨‍💻 Оператор")
 
     return keyboard.get_keyboard()
 
-
 MAIN_KB = main_keyboard()
 
-# =====================
-# 📌 ТЕКСТЫ КНОПОК
-# =====================
 MENU_BUTTONS = [
     "📲 подключение",
+    "🧾 самозанятость / ип",
     "💰 оплата и вывод",
     "🚴 работа с заказами",
     "⚠️ проблемы",
-    "🧾 как подтвердить самозанятость/ип",
     "🧊 термокороб",
     "🚲 аренда и ремонт"
 ]
 
-# =====================
-# 📤 ОТПРАВКА
-# =====================
 def send(user_id, message, keyboard=True):
     vk.messages.send(
         user_id=user_id,
@@ -84,9 +69,6 @@ def send(user_id, message, keyboard=True):
         keyboard=MAIN_KB if keyboard else None
     )
 
-# =====================
-# 🔔 УВЕДОМЛЕНИЯ АДМИНАМ
-# =====================
 def notify_admins(user_id, text):
     for admin_id in ADMINS:
         try:
@@ -102,141 +84,113 @@ def notify_admins(user_id, text):
         except Exception as e:
             print(f"[ADMIN ERROR] {e}")
 
-# =====================
-# 🧠 НОРМАЛИЗАЦИЯ
-# =====================
 def normalize_text(text):
     return text.lower().strip()
 
-# =====================
-# 🧠 УМНОЕ РАСПОЗНАВАНИЕ
-# =====================
+def close_operator(user_id):
+    operator_mode.pop(user_id, None)
+    operator_started_at.pop(user_id, None)
+    operator_has_question.pop(user_id, None)
+    operator_warned.pop(user_id, None)
+
+def operator_watchdog():
+    while True:
+        now = time.time()
+
+        for user_id in list(operator_mode.keys()):
+            if operator_has_question.get(user_id):
+                continue
+
+            started_at = operator_started_at.get(user_id)
+            if not started_at:
+                continue
+
+            elapsed = now - started_at
+
+            if elapsed >= OPERATOR_CLOSE_TIME:
+                close_operator(user_id)
+                send(
+                    user_id,
+                    "⏳ Режим оператора закрыт, так как вы не написали вопрос.\n\n"
+                    "👇 Вы можете снова пользоваться кнопками меню."
+                )
+                continue
+
+            if elapsed >= OPERATOR_WARNING_TIME and not operator_warned.get(user_id):
+                operator_warned[user_id] = True
+                send(
+                    user_id,
+                    "❗ Вы нажали кнопку оператора, но не написали вопрос.\n\n"
+                    "Напишите ваш вопрос, иначе режим оператора будет закрыт."
+                )
+
+        time.sleep(10)
+
 def detect_topic(text):
     text = normalize_text(text)
 
-    # 📲 Подключение
     if any(word in text for word in [
-        "подключение",
-        "подключиться",
-        "регистрация",
-        "зарегистрироваться",
-        "устроиться",
-        "работать курьером",
-        "хочу работать",
-        "стать курьером",
-        "оформление",
-        "оформиться"
+        "подключение", "подключиться", "регистрация", "зарегистрироваться",
+        "устроиться", "работать курьером", "хочу работать",
+        "стать курьером", "оформление", "оформиться"
     ]):
         return "подключение"
 
-    # 💰 Оплата
     if any(word in text for word in [
-        "оплата",
-        "комиссия",
-        "деньги",
-        "зарплата",
-        "доход",
-        "заработок",
-        "выплата",
-        "выплаты"
+        "оплата", "комиссия", "деньги", "зарплата",
+        "доход", "заработок", "выплата", "выплаты"
     ]):
         return "оплата"
 
-    # 💳 Вывод
     if any(word in text for word in [
-        "вывод",
-        "вывести деньги",
-        "реквизиты",
-        "карта",
-        "деньги не пришли",
-        "не пришли деньги"
+        "вывод", "вывести деньги", "реквизиты", "карта",
+        "деньги не пришли", "не пришли деньги"
     ]):
         return "вывод"
 
-    # 🚴 Работа
     if any(word in text for word in [
-        "заказ",
-        "заказы",
-        "работа",
-        "линия",
-        "доставка",
-        "посылка",
-        "мультизаказ",
-        "штраф",
-        "штрафы",
-        "дтп"
+        "заказ", "заказы", "работа", "линия", "доставка",
+        "посылка", "мультизаказ", "штраф", "штрафы", "дтп"
     ]):
         return "работа"
 
-    # ⚠️ Проблемы
     if any(word in text for word in [
-        "проблема",
-        "проблемы",
-        "корректировка",
-        "не работает",
-        "не получается",
-        "помогите",
-        "сбой"
+        "проблема", "проблемы", "корректировка",
+        "не работает", "не получается", "помогите", "сбой"
     ]):
         return "проблемы"
 
-    # 🧾 Самозанятость / ИП
     if any(word in text for word in [
-        "самозанятость",
-        "самозанятый",
-        "ип",
-        "оквэд"
+        "самозанятость", "самозанятый", "ип", "оквэд",
+        "заказы ограничены", "заказы недоступны",
+        "ограничены заказы", "недоступны заказы",
+        "заказ ограничен", "заказ недоступен"
     ]):
         return "самозанятость"
 
-    # 🧊 Термокороб
     if any(word in text for word in [
-        "термокороб",
-        "термо короб",
-        "короб",
-        "инвентарь"
+        "термокороб", "термо короб", "короб", "инвентарь"
     ]):
         return "термокороб"
 
-    # 🚲 Аренда / ремонт
     if any(word in text for word in [
-        "велосипед",
-        "велосипеды",
-        "велик",
-        "велики",
-        "электровелосипед",
-        "электровелик",
-        "электровелики",
-        "электровел",
-        "аренда",
-        "аренда велосипеда",
-        "аренда электровелика",
-        "продление аренды",
-        "продлить аренду",
-        "ремонт",
-        "ремонт велосипеда",
-        "ремонт велика",
-        "сломался велосипед",
-        "сломался велик",
+        "велосипед", "велосипеды", "велик", "велики",
+        "электровелосипед", "электровелик", "электровелики",
+        "электровел", "аренда", "аренда велосипеда",
+        "аренда электровелика", "продление аренды",
+        "продлить аренду", "ремонт", "ремонт велосипеда",
+        "ремонт велика", "сломался велосипед", "сломался велик",
         "пробило колесо"
     ]):
         return "аренда"
 
-    # 👨‍💻 Оператор
     if any(word in text for word in [
-        "оператор",
-        "человек",
-        "живой оператор",
-        "поддержка",
-        "админ"
+        "оператор", "человек", "живой оператор", "поддержка", "админ"
     ]):
         return "оператор"
 
     return None
 
-# =====================
-# 🧠 ОТВЕТЫ
-# =====================
 def get_answer(text):
     text = text.lower()
 
@@ -321,15 +275,18 @@ def get_answer(text):
         "Для связи с оператором нажмите кнопку 👨‍💻оператор"
     )
 
-# =====================
-# 🚀 ЗАПУСК
-# =====================
 def main():
     print("Бот запущен...")
+
+    threading.Thread(target=operator_watchdog, daemon=True).start()
 
     for event in longpoll.listen():
 
         if event.type != VkEventType.MESSAGE_NEW:
+            continue
+
+        # Игнорируем групповые чаты/беседы
+        if getattr(event, "from_chat", False):
             continue
 
         if not event.to_me:
@@ -346,49 +303,39 @@ def main():
         user_id = event.user_id
         text = normalize_text(event.text or "")
 
-        # =====================
-        # 👨‍💻 РЕЖИМ ОПЕРАТОРА
-        # =====================
+        # Бот не отвечает админам как обычным пользователям
+        if user_id in ADMINS:
+            continue
+
         if operator_mode.get(user_id):
 
-            # выход вручную
             if text == "стоп оператор":
-
-                operator_mode[user_id] = False
-
+                close_operator(user_id)
                 send(
                     user_id,
                     "✅ Вы вышли из режима оператора.\n\n👇 Снова доступны кнопки меню."
                 )
-
                 continue
 
-            # нажал кнопку меню
             if text in MENU_BUTTONS:
-
-                operator_mode[user_id] = False
-
+                close_operator(user_id)
                 answer = get_answer(text)
-
                 send(
                     user_id,
                     "ℹ️ Вы вышли из режима оператора и вернулись в меню бота.\n\n"
                     + answer
                 )
-
                 continue
 
-            # ВСЕ ОСТАЛЬНОЕ -> ТОЛЬКО ОПЕРАТОРУ
+            operator_has_question[user_id] = True
             notify_admins(user_id, text)
-
             continue
 
-        # =====================
-        # 👨‍💻 ВКЛЮЧЕНИЕ ОПЕРАТОРА
-        # =====================
         if text in ("👨‍💻 оператор", "оператор"):
-
             operator_mode[user_id] = True
+            operator_started_at[user_id] = time.time()
+            operator_has_question[user_id] = False
+            operator_warned[user_id] = False
 
             send(
                 user_id,
@@ -399,16 +346,8 @@ def main():
                 "👉 Напишите СТОП ОПЕРАТОР"
             )
 
-            notify_admins(
-                user_id,
-                "Пользователь подключился к оператору"
-            )
-
             continue
 
-        # =====================
-        # 🤖 УМНЫЙ БОТ
-        # =====================
         detected = detect_topic(text)
 
         if detected:
