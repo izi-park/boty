@@ -1,4 +1,3 @@
-cat > /root/bot/boty/bot.py <<'PY'
 import os
 import random
 import time
@@ -620,6 +619,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-PY
-
-python3 -m py_compile /root/bot/boty/bot.py && systemctl restart vkbot && systemctl status vkbot --no-pager
