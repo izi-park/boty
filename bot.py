@@ -12,6 +12,8 @@ import vk_api
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 from vk_api.longpoll import VkEventType, VkLongPoll
 
+import izi_box
+
 TOKEN = os.getenv("VK_TOKEN")
 
 if not TOKEN:
@@ -57,6 +59,9 @@ def main_keyboard():
     keyboard.add_button("🚲 Аренда и ремонт")
     keyboard.add_line()
 
+    keyboard.add_button("🎁 Изи Бокс", VkKeyboardColor.POSITIVE)
+    keyboard.add_line()
+
     keyboard.add_button("👨‍💻 Оператор")
 
     return keyboard.get_keyboard()
@@ -70,7 +75,8 @@ MENU_BUTTONS = [
     "🚴 работа с заказами",
     "⚠️ проблемы",
     "🧊 термокороб",
-    "🚲 аренда и ремонт"
+    "🚲 аренда и ремонт",
+    "🎁 изи бокс"
 ]
 
 URGENT_WORDS = [
@@ -93,11 +99,18 @@ URGENT_WORDS = [
 ]
 
 def send(user_id, message, keyboard=True):
+    if keyboard is True:
+        outgoing_keyboard = MAIN_KB
+    elif keyboard:
+        outgoing_keyboard = keyboard
+    else:
+        outgoing_keyboard = None
+
     vk.messages.send(
         user_id=user_id,
         message=message,
         random_id=random.randint(1, 2**63),
-        keyboard=MAIN_KB if keyboard else None
+        keyboard=outgoing_keyboard
     )
     remember_message(user_id, "bot", message, [])
 
@@ -354,6 +367,14 @@ def operator_watchdog():
 def detect_topic(text):
     text = normalize_text(text)
 
+    # Проверяем игру раньше термокороба: слова «бокс» и «коробка»
+    # относятся к Изи Боксу, а не к разделу инвентаря.
+    if any(word in text for word in [
+        "изи бокс", "изибокс", "easy box", "игра с коробками",
+        "открыть коробку", "выбрать коробку", "призовая коробка"
+    ]):
+        return "изи бокс"
+
     if any(word in text for word in [
         "подключение", "подключиться", "регистрация", "зарегистрироваться",
         "устроиться", "работать курьером", "хочу работать",
@@ -429,6 +450,17 @@ def needs_operator_attention(text, attachments):
 
 def get_answer(text):
     text = text.lower()
+
+    if "изи бокс" in text or "изибокс" in text:
+        return (
+            "🎁 Изи Бокс\n\n"
+            "Выполните 80 заказов за календарную неделю и откройте одну "
+            "из трёх коробок с пониженной комиссией парка.\n\n"
+            "📅 Заказы считаются за всю неделю: с понедельника 00:00 "
+            "до воскресенья 23:59 по московскому времени.\n\n"
+            "Чтобы посмотреть прогресс или открыть коробку, нажмите кнопку "
+            "🎁 Изи Бокс в главном меню."
+        )
 
     if "подключение" in text:
         return (
@@ -536,12 +568,18 @@ def main():
             last_event.add(event_id)
 
         user_id = event.user_id
-
-        if user_id in ADMINS:
-            continue
-
         raw_text = event.text or ""
         text = normalize_text(raw_text)
+
+        # Администраторы обычно не запускают автоответы бота, но могут
+        # полноценно проверить Изи Бокс со своих VK-аккаунтов.
+        if (
+            user_id in ADMINS
+            and text not in izi_box.IZI_BOX_TEXTS
+            and user_id not in izi_box.sessions
+        ):
+            continue
+
         attachments = extract_attachments(event_id)
 
         remember_message(user_id, "courier", raw_text, attachments)
@@ -554,6 +592,11 @@ def main():
                     user_id,
                     "✅ Вы вышли из режима оператора.\n\n👇 Снова доступны кнопки меню."
                 )
+                continue
+
+            if text == "🎁 изи бокс":
+                close_operator(user_id)
+                izi_box.show_home(user_id, send)
                 continue
 
             if text in MENU_BUTTONS:
@@ -573,6 +616,9 @@ def main():
                 attachments=attachments,
                 reason="Новое сообщение в открытой заявке"
             )
+            continue
+
+        if izi_box.handle_message(user_id, raw_text, send):
             continue
 
         if text in ("👨‍💻 оператор", "оператор"):
