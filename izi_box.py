@@ -2,6 +2,7 @@ import random
 import re
 import sqlite3
 import os
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -112,6 +113,11 @@ def init_db():
                 PRIMARY KEY (week_start, contractor_id, order_id)
             );
 
+            CREATE TABLE IF NOT EXISTS bridge_suppression (
+                vk_user_id INTEGER PRIMARY KEY,
+                expires_at REAL NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS rewards (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 contractor_id TEXT NOT NULL,
@@ -173,6 +179,26 @@ def normalize_phone(value):
 def mask_phone(phone):
     digits = re.sub(r"\D", "", str(phone or ""))
     return "+7 *** ***-" + digits[-4:] if len(digits) >= 4 else "номер скрыт"
+
+
+def suppress_bridge(vk_user_id, seconds=1800):
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO bridge_suppression(vk_user_id, expires_at)
+            VALUES (?, ?)
+            ON CONFLICT(vk_user_id) DO UPDATE SET expires_at = excluded.expires_at
+            """,
+            (int(vk_user_id), time.time() + int(seconds)),
+        )
+
+
+def clear_bridge_suppression(vk_user_id):
+    with connect() as conn:
+        conn.execute(
+            "DELETE FROM bridge_suppression WHERE vk_user_id = ?",
+            (int(vk_user_id),),
+        )
 
 
 def phone_keyboard():
@@ -442,6 +468,9 @@ def reward_status_text(row):
 
 
 def show_home(vk_user_id, send):
+    # Короткого окна хватает, чтобы мост пропустил кнопку и ответ бота.
+    # Если дальше ожидается ввод, ниже окно продлевается.
+    suppress_bridge(vk_user_id, seconds=20)
     binding = get_binding(vk_user_id)
 
     if not binding:
@@ -452,6 +481,7 @@ def show_home(vk_user_id, send):
                 "state": "confirming",
                 "contractor_id": lookup["contractor_id"],
             }
+            suppress_bridge(vk_user_id)
             send(
                 vk_user_id,
                 f"Нашёл профиль:\n\n{lookup['full_name']}\n{mask_phone(lookup['phone'])}\n\nЭто вы?",
@@ -463,12 +493,13 @@ def show_home(vk_user_id, send):
             sessions.pop(vk_user_id, None)
             send(
                 vk_user_id,
-                "🔎 Проверяю номер во Fleet. Обычно это занимает несколько минут.\n\n"
-                "Нажмите «Изи Бокс» ещё раз немного позже — найденный профиль появится автоматически."
+                "🔎 Проверяю номер. Подождите пару минут.\n\n"
+                "Затем снова нажмите «Изи Бокс» — найденный профиль появится автоматически."
             )
             return
 
         sessions[vk_user_id] = {"state": "waiting_phone"}
+        suppress_bridge(vk_user_id)
         previous_error = ""
 
         if lookup and lookup["status"] == "not_found":
@@ -491,6 +522,7 @@ def show_home(vk_user_id, send):
             + previous_error
             +
             "Для входа отправьте номер телефона, который указан в Яндекс Про.\n"
+            "Можно написать через +7 или 8, со скобками, пробелами или дефисами.\n"
             "Пример: +7 999 123-45-67",
             keyboard=phone_keyboard(),
         )
@@ -503,6 +535,7 @@ def show_home(vk_user_id, send):
             "state": "choosing_box",
             "week_start": available["week_start"],
         }
+        suppress_bridge(vk_user_id)
         send(
             vk_user_id,
             f"🎉 Цель выполнена: {available['completed_orders']} из {ORDER_TARGET} заказов!\n\n"
@@ -541,6 +574,7 @@ def handle_message(vk_user_id, raw_text, send):
 
     if text in MENU_TEXTS:
         sessions.pop(vk_user_id, None)
+        clear_bridge_suppression(vk_user_id)
         return False
 
     if text in IZI_BOX_TEXTS:
@@ -550,6 +584,7 @@ def handle_message(vk_user_id, raw_text, send):
 
     if text == "↩️ в меню":
         sessions.pop(vk_user_id, None)
+        clear_bridge_suppression(vk_user_id)
         send(vk_user_id, "Вы вернулись в главное меню 👇")
         return True
 
@@ -557,6 +592,8 @@ def handle_message(vk_user_id, raw_text, send):
 
     if not session:
         return False
+
+    suppress_bridge(vk_user_id)
 
     if session["state"] == "waiting_phone":
         phone = normalize_phone(raw_text)
@@ -571,10 +608,11 @@ def handle_message(vk_user_id, raw_text, send):
 
         queue_phone_lookup(vk_user_id, phone)
         sessions.pop(vk_user_id, None)
+        suppress_bridge(vk_user_id, seconds=20)
         send(
             vk_user_id,
-            "🔎 Номер принят. Проверяю его во Fleet.\n\n"
-            "Это может занять несколько минут из-за ограничений Яндекса. Затем снова нажмите «Изи Бокс»."
+            "🔎 Номер принят. Подождите пару минут.\n\n"
+            "Затем снова нажмите «Изи Бокс»."
         )
         return True
 
@@ -633,6 +671,7 @@ def handle_message(vk_user_id, raw_text, send):
 
         reward, error = create_reward(binding, session["week_start"], box_number)
         sessions.pop(vk_user_id, None)
+        suppress_bridge(vk_user_id, seconds=20)
 
         if not reward:
             send(vk_user_id, error)

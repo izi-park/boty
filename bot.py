@@ -98,7 +98,7 @@ URGENT_WORDS = [
     "не могу выйти на линию"
 ]
 
-def send(user_id, message, keyboard=True):
+def send(user_id, message, keyboard=True, remember=True):
     if keyboard is True:
         outgoing_keyboard = MAIN_KB
     elif keyboard:
@@ -112,7 +112,14 @@ def send(user_id, message, keyboard=True):
         random_id=random.randint(1, 2**63),
         keyboard=outgoing_keyboard
     )
-    remember_message(user_id, "bot", message, [])
+    if remember:
+        remember_message(user_id, "bot", message, [])
+
+
+def send_izi_box(user_id, message, keyboard=True):
+    # Игровой диалог не относится к обращениям в поддержку и не должен
+    # попадать в историю, которую затем получают операторы.
+    send(user_id, message, keyboard=keyboard, remember=False)
 
 def normalize_text(text):
     return text.lower().strip()
@@ -580,11 +587,15 @@ def main():
         ):
             continue
 
-        attachments = extract_attachments(event_id)
-
-        remember_message(user_id, "courier", raw_text, attachments)
-
         if operator_mode.get(user_id):
+
+            if text == "🎁 изи бокс":
+                close_operator(user_id)
+                izi_box.show_home(user_id, send_izi_box)
+                continue
+
+            attachments = extract_attachments(event_id)
+            remember_message(user_id, "courier", raw_text, attachments)
 
             if text == "стоп оператор":
                 close_operator(user_id)
@@ -592,11 +603,6 @@ def main():
                     user_id,
                     "✅ Вы вышли из режима оператора.\n\n👇 Снова доступны кнопки меню."
                 )
-                continue
-
-            if text == "🎁 изи бокс":
-                close_operator(user_id)
-                izi_box.show_home(user_id, send)
                 continue
 
             if text in MENU_BUTTONS:
@@ -618,10 +624,14 @@ def main():
             )
             continue
 
-        if izi_box.handle_message(user_id, raw_text, send):
+        if izi_box.handle_message(user_id, raw_text, send_izi_box):
             continue
 
+        attachments = extract_attachments(event_id)
+        remember_message(user_id, "courier", raw_text, attachments)
+
         if text in ("👨‍💻 оператор", "оператор"):
+            izi_box.clear_bridge_suppression(user_id)
             operator_mode[user_id] = True
             operator_started_at[user_id] = time.time()
             operator_has_question[user_id] = False
