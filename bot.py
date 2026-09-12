@@ -1,11 +1,18 @@
+import sys
+sys.path.insert(0, "/root/fleet")
+import return_campaign_core as return_core
 import os
 import random
 import time
 import threading
 import json
+import re
+import sqlite3
 import urllib.request
 import urllib.parse
 import urllib.error
+import transfer_form
+from datetime import datetime, timedelta, timezone
 
 import vk_api
 
@@ -27,6 +34,42 @@ ADMINS = [8302706, 526574493]
 
 SUPPORT_APP_URL = os.getenv("SUPPORT_APP_URL", "http://127.0.0.1:8001/api/vk/message")
 SUPPORT_APP_SECRET = os.getenv("SUPPORT_APP_SECRET", "izi_test_2026")
+
+# === RETURN 7% CAMPAIGN ===
+RETURN_CAMPAIGN_DB = "/root/fleet/churn_return.db"
+RETURN_CODE_RE = re.compile(r"\bR7-[A-Z0-9]{5}\b", re.IGNORECASE)
+
+# Сообщение похоже на промокод, но мы НЕ исправляем его автоматически.
+# Нужна только для того, чтобы ошибочный код не уходил оператору.
+RETURN_CODE_LIKE_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"[A-Za-z0-9]{1,6}(?:-|–|—)[A-Za-z0-9]{3,12}"
+    r"(?![A-Za-z0-9])",
+    re.IGNORECASE
+)
+
+
+def looks_like_return_code(text):
+    raw = str(text or "").strip()
+
+    # Телефон может содержать дефисы:
+    # 8-913-642-16-80
+    # Из-за этого он внешне похож на промокод.
+    # Если в сообщении 10+ цифр — промокодом его не считаем.
+    digits = re.sub(r"\D", "", raw)
+
+    if len(digits) >= 10:
+        return False
+
+    return bool(
+        RETURN_CODE_LIKE_RE.search(raw)
+    )
+
+RETURN_ORDER_CACHE = {}
+RETURN_ORDER_CACHE_SECONDS = 300
+RETURN_FLEET_LIMIT_UNTIL = None
+
+
 
 operator_mode = {}
 operator_started_at = {}
@@ -117,12 +160,534 @@ def send(user_id, message, keyboard=True, remember=True):
 
 
 def send_izi_box(user_id, message, keyboard=True):
-    # Игровой диалог не относится к обращениям в поддержку и не должен
-    # попадать в историю, которую затем получают операторы.
+    # Игровые сообщения не относятся к обращениям оператору.
     send(user_id, message, keyboard=keyboard, remember=False)
 
 def normalize_text(text):
     return text.lower().strip()
+
+def extract_return_code(text):
+    match = RETURN_CODE_RE.search(str(text or ""))
+    if not match:
+        return None
+
+    return match.group(0).upper()
+
+
+def load_return_fleet_config():
+    with open("/root/fleet/config.json", "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def return_api_json(method, url, headers, payload=None):
+    data = None
+
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers=headers,
+        method=method
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+            return resp.status, json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        print(
+            f"[RETURN FLEET HTTP] {e.code} {body[:1000]}",
+            flush=True
+        )
+        return e.code, None
+    except Exception as e:
+        print(
+            f"[RETURN FLEET ERROR] {e!r}",
+            flush=True
+        )
+        return 0, None
+
+
+def parse_return_dt(value):
+    if not value:
+        return None
+
+    try:
+        value = str(value).strip()
+
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+
+        dt = datetime.fromisoformat(value)
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        return dt.astimezone(timezone.utc)
+
+    except Exception as e:
+        print(
+            f"[RETURN DATE ERROR] value={value!r} error={e!r}",
+            flush=True
+        )
+        return None
+
+
+def get_return_window(row):
+    """
+    Реальная акция:
+    сначала используем подтверждённое время доставки SMS,
+    если его нет — время отправки.
+
+    Для наших текущих preview-тестов SMS ещё не отправлялась,
+    поэтому временно используем created_at только для тестирования.
+    """
+
+    start = (
+        parse_return_dt(row["sms_delivered_at"])
+        or parse_return_dt(row["sms_sent_at"])
+    )
+
+    test_preview = False
+
+    if start is None and row["status"] == "preview":
+        start = parse_return_dt(row["created_at"])
+        test_preview = True
+
+    if start is None:
+        return None, None, False
+
+    deadline = start + timedelta(hours=24)
+
+    return start, deadline, test_preview
+
+
+def get_return_orders_for_window(contractor_id, start_dt, deadline_dt):
+    global RETURN_FLEET_LIMIT_UNTIL
+
+    now_utc = datetime.now(timezone.utc)
+
+    # Если Яндекс недавно дал 429 — временно вообще не стучимся.
+    if (
+        RETURN_FLEET_LIMIT_UNTIL is not None
+        and now_utc < RETURN_FLEET_LIMIT_UNTIL
+    ):
+        print(
+            f"[RETURN FLEET COOLDOWN] until="
+            f"{RETURN_FLEET_LIMIT_UNTIL.isoformat()}",
+            flush=True
+        )
+        return "RATE_LIMIT"
+
+    cache_key = (
+        str(contractor_id),
+        start_dt.isoformat(),
+        deadline_dt.isoformat()
+    )
+
+    cached = RETURN_ORDER_CACHE.get(cache_key)
+
+    if cached:
+        cached_at, cached_orders = cached
+        age = (now_utc - cached_at).total_seconds()
+
+        if age < RETURN_ORDER_CACHE_SECONDS:
+            print(
+                f"[RETURN ORDER CACHE] "
+                f"{contractor_id} age={int(age)}s "
+                f"orders={len(cached_orders)}",
+                flush=True
+            )
+            return cached_orders
+
+    cfg = load_return_fleet_config()
+
+    query_to = min(now_utc, deadline_dt)
+
+    headers = {
+        "X-Client-ID": cfg["FLEET_CLIENT_ID"],
+        "X-API-Key": cfg["FLEET_API_KEY"],
+        "X-Park-ID": cfg["FLEET_PARK_ID"],
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    payload = {
+        "query": {
+            "park": {
+                "id": cfg["FLEET_PARK_ID"],
+                "driver_profile": {
+                    "id": contractor_id
+                },
+                "order": {
+                    "ended_at": {
+                        "from": start_dt.isoformat(),
+                        "to": query_to.isoformat()
+                    },
+                    "statuses": [
+                        "complete"
+                    ]
+                }
+            }
+        },
+        "limit": 50
+    }
+
+    status, data = return_api_json(
+        "POST",
+        "https://fleet-api.taxi.yandex.net/v1/parks/orders/list",
+        headers,
+        payload
+    )
+
+    if status == 429:
+        RETURN_FLEET_LIMIT_UNTIL = (
+            datetime.now(timezone.utc)
+            + timedelta(minutes=2)
+        )
+
+        print(
+            f"[RETURN FLEET RATE LIMIT] cooldown until "
+            f"{RETURN_FLEET_LIMIT_UNTIL.isoformat()}",
+            flush=True
+        )
+
+        return "RATE_LIMIT"
+
+    if status != 200 or data is None:
+        return None
+
+    orders = data.get("orders", [])
+
+    RETURN_ORDER_CACHE[cache_key] = (
+        datetime.now(timezone.utc),
+        orders
+    )
+
+    return orders
+
+
+
+def format_time_left(deadline):
+    now_utc = datetime.now(timezone.utc)
+
+    seconds = int((deadline - now_utc).total_seconds())
+
+    if seconds <= 0:
+        return "0 мин"
+
+    hours, remainder = divmod(seconds, 3600)
+    minutes = remainder // 60
+
+    if hours > 0:
+        return f"{hours} ч {minutes} мин"
+
+    return f"{minutes} мин"
+
+
+def handle_return_code(user_id, raw_text):
+    code = extract_return_code(raw_text)
+
+    if not code:
+        if looks_like_return_code(raw_text):
+            send(
+                user_id,
+                "❌ Код не найден или введён неверно.\n\n"
+                "Проверьте код в полученном сообщении "
+                "и отправьте его ещё раз полностью, без изменений."
+            )
+            return True
+
+        return False
+
+    print(
+        f"[RETURN CODE] VK user={user_id} code={code}",
+        flush=True
+    )
+
+    try:
+        registration = return_core.register_return_code(
+            code,
+            user_id
+        )
+    except Exception as e:
+        print(
+            f"[RETURN REGISTER ERROR] {e!r}",
+            flush=True
+        )
+
+        send(
+            user_id,
+            "❌ Сейчас не удалось проверить код. "
+            "Попробуйте немного позже."
+        )
+        return True
+
+    reg_reason = registration.get("reason")
+
+    if reg_reason == "code_claim_expired":
+        send(
+            user_id,
+            "⏱ Срок действия предложения истёк.\n\n"
+            "Код можно отправить в течение 3 дней "
+            "после получения SMS."
+        )
+        return True
+
+    if reg_reason in (
+        "code_not_found",
+        "not_found",
+        "unknown_code",
+        "invalid_code",
+    ):
+        send(
+            user_id,
+            "❌ Код не найден или введён неверно.\n\n"
+            "Проверьте код в полученном сообщении "
+            "и отправьте его ещё раз полностью, без изменений."
+        )
+        return True
+
+    print(
+        f"[RETURN REGISTER] code={code} "
+        f"reason={reg_reason}",
+        flush=True
+    )
+
+    # --------------------------------------------------------
+    # PREVIEW
+    # Никакой привязки VK и никакой смены комиссии.
+    # --------------------------------------------------------
+
+    if reg_reason == "preview_test":
+        send(
+            user_id,
+            "✅ Код акции распознан.\n\n"
+            "Это тестовая запись. "
+            "VK не привязан, заказы и комиссия не изменялись."
+        )
+        return True
+
+    if reg_reason == "code_not_found":
+        send(
+            user_id,
+            "❌ Такой код акции не найден. "
+            "Проверьте код из SMS и отправьте его ещё раз."
+        )
+        return True
+
+    if reg_reason == "sms_not_started":
+        send(
+            user_id,
+            "❌ Код найден, но отправка SMS "
+            "ещё не зарегистрирована системой. "
+            "Попробуйте немного позже."
+        )
+        return True
+
+    if reg_reason == "offer_expired":
+        send(
+            user_id,
+            "Срок действия этого кода уже закончился."
+        )
+        return True
+
+    if reg_reason == "bound_to_other_vk":
+        send(
+            user_id,
+            "❌ Этот код уже привязан "
+            "к другому аккаунту VK."
+        )
+        return True
+
+    if reg_reason != "registered":
+        send(
+            user_id,
+            "❌ Сейчас не удалось обработать код. "
+            "Попробуйте немного позже."
+        )
+        return True
+
+    first_name = (
+        registration.get("first_name")
+        or "Курьер"
+    )
+
+    # --------------------------------------------------------
+    # Код зарегистрирован.
+    # Теперь ядро САМО проверяет:
+    # SMS -> 24 часа -> заказ -> 7% -> PUT -> GET 1.5.
+    # --------------------------------------------------------
+
+    try:
+        result = return_core.activate_discount(
+            code,
+            execute=True
+        )
+    except Exception as e:
+        print(
+            f"[RETURN ACTIVATE ERROR] {e!r}",
+            flush=True
+        )
+
+        send(
+            user_id,
+            "❌ Сейчас не удалось проверить выполнение акции. "
+            "Код уже сохранён, повторно отправлять его не нужно."
+        )
+        return True
+
+    reason = result.get("reason")
+
+    if reason == "offer_expired":
+        send(
+            user_id,
+            f"{first_name}, 24 часа с момента отправки "
+            "кода уже истекли. "
+            "Срок действия предложения завершён."
+        )
+        return True
+
+    print(
+        f"[RETURN ACTIVATE] code={code} "
+        f"reason={reason} "
+        f"changed={result.get('changed')}",
+        flush=True
+    )
+
+    if reason == "waiting_order":
+        seconds = result.get("seconds_left") or 0
+        left = return_core.format_left(seconds)
+
+        send(
+            user_id,
+            f"{first_name}, код принят 👍\n\n"
+            "Для активации комиссии 1,5% выполните "
+            "хотя бы 1 заказ в Яндекс Доставке "
+            "через Изи Парк в течение 24 часов "
+            "с момента отправки кода.\n\n"
+            f"Осталось: {left}.\n\n"
+            "Повторно отправлять код не нужно — "
+            "система уже сохранила его. "
+            "После завершения заказа скидка "
+            "активируется автоматически."
+        )
+        return True
+
+    if reason == "activated":
+        expires = return_core.parse_dt(
+            result.get("expires_at")
+        )
+
+        expires_text = (
+            expires.strftime("%d.%m.%Y")
+            if expires
+            else "через 3 месяца"
+        )
+
+        send(
+            user_id,
+            f"{first_name}, условие акции выполнено 🎉\n\n"
+            "Комиссия в Изи Парк успешно снижена "
+            "до 1,5% на 3 месяца.\n"
+            f"Действует до {expires_text}."
+        )
+        return True
+
+    if reason == "already_activated":
+        expires = return_core.parse_dt(
+            result.get("expires_at")
+        )
+
+        expires_text = (
+            expires.strftime("%d.%m.%Y")
+            if expires
+            else "указанной даты"
+        )
+
+        send(
+            user_id,
+            f"{first_name}, комиссия 1,5% "
+            "уже активирована ✅\n"
+            f"Действует до {expires_text}."
+        )
+        return True
+
+    if reason == "offer_expired":
+        send(
+            user_id,
+            f"{first_name}, срок акции закончился.\n\n"
+            "В течение 24 часов не был найден "
+            "выполненный заказ через Изи Парк."
+        )
+        return True
+
+    if reason == "orders_rate_limited":
+        send(
+            user_id,
+            f"{first_name}, код принят 👍\n\n"
+            "Сейчас Яндекс временно ограничил "
+            "проверку заказов. "
+            "Повторно отправлять код не нужно — "
+            "заявка уже сохранена."
+        )
+        return True
+
+    if reason == "orders_check_failed":
+        send(
+            user_id,
+            f"{first_name}, код принят 👍\n\n"
+            "Сейчас не удалось обновить данные по заказам. "
+            "Повторно отправлять код не нужно — "
+            "заявка сохранена."
+        )
+        return True
+
+    if reason in (
+        "wrong_rule",
+        "rule_changed_before_put",
+        "already_15",
+    ):
+        send(
+            user_id,
+            "⚠️ Условия вашего профиля уже отличаются "
+            "от условий этой акции. "
+            "Автоматически менять комиссию не буду. "
+            "Обратитесь к оператору."
+        )
+        return True
+
+    if reason in (
+        "put_failed",
+        "verify_get_failed",
+        "verify_rule_failed",
+        "profile_read_failed",
+        "fleet_error",
+    ):
+        print(
+            f"[RETURN FLEET CHANGE FAILED] {result}",
+            flush=True
+        )
+
+        send(
+            user_id,
+            "❌ Автоматическая активация сейчас не завершилась.\n\n"
+            "Комиссия не считается активированной, "
+            "пока Fleet не подтвердит значение 1,5%. "
+            "Обратитесь к оператору."
+        )
+        return True
+
+    send(
+        user_id,
+        "❌ Сейчас не удалось завершить проверку акции. "
+        "Код уже сохранён."
+    )
+    return True
+
 
 def close_operator(user_id):
     operator_mode.pop(user_id, None)
@@ -148,36 +713,10 @@ def get_user_name(user_id):
     user_name_cache[user_id] = fallback
     return fallback
 
-def post_to_app(user_id, text="", reason="Сообщение из ВК", attachment_type="", attachment_text="", attachment_url="", sender="courier"):
-    payload = {
-        "vk_id": str(user_id),
-        "courier": get_user_name(user_id),
-        "text": text or "",
-        "reason": reason or "Сообщение из ВК",
-        "attachment_type": attachment_type or "",
-        "attachment_text": attachment_text or "",
-        "attachment_url": attachment_url or "",
-        "sender": sender if sender in ["courier", "bot", "admin"] else "courier"
-    }
+def post_to_app(*args, **kwargs):
+    # Отключено: приложение теперь получает VK-события только через vk-incoming-bridge.
+    return False
 
-    url = SUPPORT_APP_URL + "?" + urllib.parse.urlencode({"secret": SUPPORT_APP_SECRET})
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-
-    req = urllib.request.Request(
-        url=url,
-        data=data,
-        headers={"Content-Type": "application/json; charset=utf-8"},
-        method="POST"
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            body = resp.read().decode("utf-8", errors="ignore")
-            print(f"[APP OK] {body}")
-            return True
-    except Exception as e:
-        print(f"[APP ERROR] {e}")
-        return False
 
 def remember_message(user_id, sender, text="", attachments=None):
     if attachments is None:
@@ -211,30 +750,10 @@ def remember_message(user_id, sender, text="", attachments=None):
     dialog_history[user_id].extend(items)
     dialog_history[user_id] = dialog_history[user_id][-HISTORY_LIMIT:]
 
-def send_unsent_history_to_app(user_id, reason):
-    history = dialog_history.get(user_id, [])
+def send_unsent_history_to_app(*args, **kwargs):
+    # Отключено: приложение теперь получает VK-события только через vk-incoming-bridge.
+    return False
 
-    sent_any = False
-
-    for item in history:
-        if item.get("sent_to_app"):
-            continue
-
-        ok = post_to_app(
-            user_id=user_id,
-            text=item.get("text", ""),
-            reason=reason,
-            attachment_type=item.get("attachment_type", ""),
-            attachment_text=item.get("attachment_text", ""),
-            attachment_url=item.get("attachment_url", ""),
-            sender=item.get("sender", "courier")
-        )
-
-        if ok:
-            item["sent_to_app"] = True
-            sent_any = True
-
-    return sent_any
 
 def extract_attachments(message_id):
     attachments = []
@@ -374,14 +893,6 @@ def operator_watchdog():
 def detect_topic(text):
     text = normalize_text(text)
 
-    # Проверяем игру раньше термокороба: слова «бокс» и «коробка»
-    # относятся к Изи Боксу, а не к разделу инвентаря.
-    if any(word in text for word in [
-        "изи бокс", "изибокс", "easy box", "игра с коробками",
-        "открыть коробку", "выбрать коробку", "призовая коробка"
-    ]):
-        return "изи бокс"
-
     if any(word in text for word in [
         "подключение", "подключиться", "регистрация", "зарегистрироваться",
         "устроиться", "работать курьером", "хочу работать",
@@ -457,17 +968,6 @@ def needs_operator_attention(text, attachments):
 
 def get_answer(text):
     text = text.lower()
-
-    if "изи бокс" in text or "изибокс" in text:
-        return (
-            "🎁 Изи Бокс\n\n"
-            "Выполните 80 заказов за календарную неделю и откройте одну "
-            "из трёх коробок с пониженной комиссией парка.\n\n"
-            "📅 Заказы считаются за всю неделю: с понедельника 00:00 "
-            "до воскресенья 23:59 по московскому времени.\n\n"
-            "Чтобы посмотреть прогресс или открыть коробку, нажмите кнопку "
-            "🎁 Изи Бокс в главном меню."
-        )
 
     if "подключение" in text:
         return (
@@ -553,6 +1053,15 @@ def get_answer(text):
 def main():
     print("Бот запущен...")
 
+    transfer_form.configure(
+        vk=vk,
+        admins=ADMINS,
+        get_user_name=get_user_name,
+        get_info_answer=get_answer,
+        close_operator=close_operator,
+        main_keyboard=MAIN_KB,
+    )
+
     threading.Thread(target=operator_watchdog, daemon=True).start()
 
     for event in longpoll.listen():
@@ -575,27 +1084,49 @@ def main():
             last_event.add(event_id)
 
         user_id = event.user_id
+
         raw_text = event.text or ""
         text = normalize_text(raw_text)
 
-        # Администраторы обычно не запускают автоответы бота, но могут
-        # полноценно проверить Изи Бокс со своих VK-аккаунтов.
-        if (
-            user_id in ADMINS
-            and text not in izi_box.IZI_BOX_TEXTS
-            and user_id not in izi_box.sessions
-        ):
+        # Изи Бокс обрабатываем до истории поддержки и анкеты.
+        if operator_mode.get(user_id) and text == "🎁 изи бокс":
+            close_operator(user_id)
+
+        if izi_box.handle_message(user_id, raw_text, send_izi_box):
+            continue
+        attachments = extract_attachments(event_id)
+
+        form_was_active = transfer_form.is_active(user_id)
+
+        if not form_was_active:
+            remember_message(
+                user_id,
+                "courier",
+                raw_text,
+                attachments
+            )
+
+        # Если человек уже находится внутри анкеты,
+        # его ответ сначала обрабатывает именно анкета.
+        # Это важно для телефонов, дат и адресов:
+        # они не должны случайно восприниматься как промокоды.
+        if form_was_active:
+            if transfer_form.handle(user_id, raw_text):
+                continue
+
+        # Акционный код обрабатываем до обычного меню.
+        if handle_return_code(user_id, raw_text):
+            continue
+
+        # Если активной анкеты ещё не было,
+        # здесь обрабатываются кнопки входа в неё.
+        if transfer_form.handle(user_id, raw_text):
+            continue
+
+        if user_id in ADMINS:
             continue
 
         if operator_mode.get(user_id):
-
-            if text == "🎁 изи бокс":
-                close_operator(user_id)
-                izi_box.show_home(user_id, send_izi_box)
-                continue
-
-            attachments = extract_attachments(event_id)
-            remember_message(user_id, "courier", raw_text, attachments)
 
             if text == "стоп оператор":
                 close_operator(user_id)
@@ -623,12 +1154,6 @@ def main():
                 reason="Новое сообщение в открытой заявке"
             )
             continue
-
-        if izi_box.handle_message(user_id, raw_text, send_izi_box):
-            continue
-
-        attachments = extract_attachments(event_id)
-        remember_message(user_id, "courier", raw_text, attachments)
 
         if text in ("👨‍💻 оператор", "оператор"):
             izi_box.clear_bridge_suppression(user_id)
