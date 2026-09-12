@@ -106,6 +106,14 @@ def init_db():
                 PRIMARY KEY (contractor_id, week_start)
             );
 
+            CREATE TABLE IF NOT EXISTS progress_requests (
+                contractor_id TEXT PRIMARY KEY,
+                requested_at TEXT NOT NULL,
+                next_try_at TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS order_scan_items (
                 week_start TEXT NOT NULL,
                 contractor_id TEXT NOT NULL,
@@ -279,6 +287,36 @@ def queue_phone_lookup(vk_user_id, phone):
             """,
             (int(vk_user_id),),
         )
+
+        # Повторный ввод уже найденного номера не должен снова заставлять
+        # пользователя ждать Fleet. Копируем подтверждённый результат.
+        found = conn.execute(
+            """
+            SELECT contractor_id, full_name
+            FROM phone_lookups
+            WHERE vk_user_id = ? AND phone = ? AND status = 'found'
+              AND contractor_id IS NOT NULL
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (int(vk_user_id), phone),
+        ).fetchone()
+
+        if found:
+            conn.execute(
+                """
+                INSERT INTO phone_lookups(
+                    vk_user_id, phone, status, contractor_id, full_name,
+                    requested_at, checked_at, attempts
+                ) VALUES (?, ?, 'found', ?, ?, ?, ?, 0)
+                """,
+                (
+                    int(vk_user_id), phone, found["contractor_id"],
+                    found["full_name"], requested_at, requested_at,
+                ),
+            )
+            return True
+
         conn.execute(
             """
             INSERT INTO phone_lookups(
@@ -287,6 +325,48 @@ def queue_phone_lookup(vk_user_id, phone):
             """,
             (int(vk_user_id), phone, requested_at, requested_at),
         )
+    return False
+
+
+def request_progress_refresh(contractor_id):
+    """Ставит точечное обновление счётчика, если кэш старше 10 минут."""
+    current_week = week_start_for()
+    fresh_after = now_moscow() - timedelta(minutes=10)
+
+    with connect() as conn:
+        progress = conn.execute(
+            """
+            SELECT updated_at FROM weekly_progress
+            WHERE contractor_id = ? AND week_start = ?
+            """,
+            (contractor_id, current_week),
+        ).fetchone()
+
+        if progress:
+            try:
+                updated = datetime.fromisoformat(progress["updated_at"])
+                if updated >= fresh_after:
+                    return False
+            except (TypeError, ValueError):
+                pass
+
+        requested_at = now_moscow().isoformat()
+        conn.execute(
+            """
+            INSERT INTO progress_requests(
+                contractor_id, requested_at, next_try_at, attempts, last_error
+            ) VALUES (?, ?, ?, 0, NULL)
+            ON CONFLICT(contractor_id) DO UPDATE SET
+                requested_at = excluded.requested_at,
+                next_try_at = CASE
+                    WHEN progress_requests.next_try_at < excluded.next_try_at
+                    THEN progress_requests.next_try_at
+                    ELSE excluded.next_try_at
+                END
+            """,
+            (contractor_id, requested_at, requested_at),
+        )
+    return True
 
 
 def bind(vk_user_id, courier):
@@ -528,6 +608,8 @@ def show_home(vk_user_id, send):
         )
         return
 
+    refresh_requested = request_progress_refresh(binding["contractor_id"])
+
     available = latest_available_week(binding["contractor_id"])
 
     if available:
@@ -557,6 +639,8 @@ def show_home(vk_user_id, send):
             f"Осталось: {remaining}\n"
             f"Обновлено: {updated} МСК"
         )
+        if refresh_requested:
+            message += "\n\n🔄 Обновляю счётчик. Новое значение появится через пару минут."
     else:
         message = (
             "🎁 Изи Бокс\n\n"

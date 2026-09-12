@@ -28,6 +28,7 @@ ORDERS_URL = "https://fleet-api.taxi.yandex.net/v1/parks/orders/list"
 
 PROFILE_SYNC_MINUTES = 60
 ORDER_SYNC_MINUTES = 15
+ORDER_QUIET_SECONDS = int(os.getenv("IZI_BOX_ORDER_QUIET_SECONDS", "70"))
 APPLY_CHANGES = os.getenv("IZI_BOX_APPLY", "0").strip() == "1"
 
 
@@ -383,72 +384,51 @@ def process_phone_lookup(headers, park_id):
 
 
 def sync_orders(headers, park_id):
+    """Обновляет одного запрошенного курьера одним точечным запросом."""
+    current = now()
     with connect() as conn:
-        binding_count = conn.execute("SELECT COUNT(*) FROM bindings").fetchone()[0]
+        row = conn.execute(
+            """
+            SELECT r.contractor_id
+            FROM progress_requests r
+            JOIN bindings b ON b.contractor_id = r.contractor_id
+            WHERE r.next_try_at <= ?
+            ORDER BY r.requested_at
+            LIMIT 1
+            """,
+            (current.isoformat(),),
+        ).fetchone()
 
-    if not binding_count:
-        print("[IZI BOX] Привязок пока нет, заказы не запрашиваем", flush=True)
+    if not row:
         return
 
-    current = now()
+    contractor_id = row["contractor_id"]
     current_week = (current - timedelta(days=current.weekday())).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
 
-    scan_week = get_meta("orders_scan_week_start")
-    cursor = get_meta("orders_scan_cursor")
-
-    if not scan_week:
-        if not due("orders_synced_at", ORDER_SYNC_MINUTES):
-            return
-
-        scan_week = current_week.isoformat()
-        period_end = current.isoformat()
-
-        with connect() as conn:
-            conn.execute("DELETE FROM order_scan_items")
-            conn.execute(
-                "INSERT INTO izi_box_meta(key, value) VALUES ('orders_scan_week_start', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (scan_week,),
-            )
-            conn.execute(
-                "INSERT INTO izi_box_meta(key, value) VALUES ('orders_scan_period_end', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (period_end,),
-            )
-            conn.execute(
-                "INSERT INTO izi_box_meta(key, value) VALUES ('orders_scan_pages', '0') "
-                "ON CONFLICT(key) DO UPDATE SET value = '0'"
-            )
-
-        cursor = None
-        print(f"[IZI BOX] Начат снимок заказов с {scan_week}", flush=True)
-    elif scan_week != current_week.isoformat():
-        with connect() as conn:
-            conn.execute("DELETE FROM order_scan_items")
-            conn.execute(
-                "DELETE FROM izi_box_meta WHERE key LIKE 'orders_scan_%'"
-            )
-        print("[IZI BOX] Старый снимок сброшен после смены недели", flush=True)
-        return
-
-    period_end = get_meta("orders_scan_period_end") or current.isoformat()
+    # Cron запускает worker под общим flock с auto_disable. Пока мы ждём,
+    # другие Fleet-задачи не стартуют, и лимит официального API успевает
+    # освободиться. Ожидание происходит в фоне, PuTTY держать открытым не надо.
+    print(
+        f"[IZI BOX] Обновляю счётчик курьера; безопасная пауза {ORDER_QUIET_SECONDS} сек",
+        flush=True,
+    )
+    time.sleep(max(0, ORDER_QUIET_SECONDS))
+    period_end = now().isoformat()
     payload = {
         "query": {
             "park": {
                 "id": park_id,
+                "driver_profile": {"id": contractor_id},
                 "order": {
-                    "ended_at": {"from": scan_week, "to": period_end},
+                    "ended_at": {"from": current_week.isoformat(), "to": period_end},
                     "statuses": ["complete"],
                 },
             }
         },
         "limit": 500,
     }
-
-    if cursor:
-        payload["cursor"] = cursor
 
     response = requests.post(
         ORDERS_URL,
@@ -458,84 +438,64 @@ def sync_orders(headers, park_id):
     )
 
     if response.status_code == 429:
-        print("[IZI BOX] Orders 429; страница отложена до следующего запуска", flush=True)
+        retry_at = (now() + timedelta(minutes=3)).isoformat()
+        with connect() as conn:
+            conn.execute(
+                """
+                UPDATE progress_requests
+                SET attempts = attempts + 1, next_try_at = ?, last_error = 'Fleet HTTP 429'
+                WHERE contractor_id = ?
+                """,
+                (retry_at, contractor_id),
+            )
+        print("[IZI BOX] Orders 429; повтор через 3 минуты", flush=True)
         return
 
     if response.status_code != 200:
-        raise RuntimeError(
-            f"orders HTTP {response.status_code}: {response.text[:500]}"
-        )
+        retry_at = (now() + timedelta(minutes=5)).isoformat()
+        error = f"Fleet HTTP {response.status_code}: {response.text[:200]}"
+        with connect() as conn:
+            conn.execute(
+                """
+                UPDATE progress_requests
+                SET attempts = attempts + 1, next_try_at = ?, last_error = ?
+                WHERE contractor_id = ?
+                """,
+                (retry_at, error, contractor_id),
+            )
+        print(f"[IZI BOX] Orders {response.status_code}; повтор через 5 минут", flush=True)
+        return
 
     data = response.json()
     orders = data.get("orders", [])
-    next_cursor = data.get("cursor")
-    pages = int(get_meta("orders_scan_pages") or 0) + 1
+    if data.get("cursor"):
+        raise RuntimeError("У одного курьера больше 500 заказов за неделю")
+
+    order_ids = {
+        str(order.get("id") or "")
+        for order in orders
+        if order.get("status") == "complete"
+    }
+    order_ids.discard("")
+    count = len(order_ids)
+    updated_at = now().isoformat()
 
     with connect() as conn:
-        for order in orders:
-            if order.get("status") != "complete":
-                continue
-            driver = order.get("driver_profile") or {}
-            contractor_id = str(driver.get("id") or "").strip()
-            order_id = str(order.get("id") or "").strip()
-            if contractor_id and order_id:
-                conn.execute(
-                    "INSERT OR IGNORE INTO order_scan_items(week_start, contractor_id, order_id) "
-                    "VALUES (?, ?, ?)",
-                    (scan_week, contractor_id, order_id),
-                )
-
         conn.execute(
-            "INSERT INTO izi_box_meta(key, value) VALUES ('orders_scan_pages', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (str(pages),),
+            """
+            INSERT INTO weekly_progress(
+                contractor_id, week_start, completed_orders, updated_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(contractor_id, week_start) DO UPDATE SET
+                completed_orders = excluded.completed_orders,
+                updated_at = excluded.updated_at
+            """,
+            (contractor_id, current_week.date().isoformat(), count, updated_at),
         )
-
-        if next_cursor and next_cursor != cursor:
-            conn.execute(
-                "INSERT INTO izi_box_meta(key, value) VALUES ('orders_scan_cursor', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (next_cursor,),
-            )
-            print(f"[IZI BOX] Страница заказов {pages} сохранена", flush=True)
-            return
-
-        updated_at = now().isoformat()
-        bindings = conn.execute("SELECT contractor_id FROM bindings").fetchall()
-
-        for row in bindings:
-            contractor_id = row["contractor_id"]
-            count = conn.execute(
-                "SELECT COUNT(*) FROM order_scan_items "
-                "WHERE week_start = ? AND contractor_id = ?",
-                (scan_week, contractor_id),
-            ).fetchone()[0]
-            conn.execute(
-                """
-                INSERT INTO weekly_progress(
-                    contractor_id, week_start, completed_orders, updated_at
-                ) VALUES (?, ?, ?, ?)
-                ON CONFLICT(contractor_id, week_start) DO UPDATE SET
-                    completed_orders = excluded.completed_orders,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    contractor_id,
-                    current_week.date().isoformat(),
-                    int(count),
-                    updated_at,
-                ),
-            )
-
-        conn.execute(
-            "INSERT INTO izi_box_meta(key, value) VALUES ('orders_synced_at', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (updated_at,),
-        )
-        conn.execute("DELETE FROM order_scan_items")
+        conn.execute("DELETE FROM progress_requests WHERE contractor_id = ?", (contractor_id,))
         conn.execute("DELETE FROM izi_box_meta WHERE key LIKE 'orders_scan_%'")
 
-    print(f"[IZI BOX] Снимок заказов готов, страниц: {pages}", flush=True)
+    print(f"[IZI BOX] Счётчик обновлён: {count} заказов", flush=True)
 
 
 def get_profile(headers, contractor_id):
